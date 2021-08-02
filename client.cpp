@@ -43,6 +43,7 @@ int main() {
             break;
         }
     }
+    ::freeaddrinfo(addrs);
 
     if (connected) {
         ::printf("Connected successfully\n");
