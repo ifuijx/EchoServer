@@ -76,33 +76,55 @@ int main() {
             ::printf("failed to accept, %s\n", ::strerror(errno));
         }
 
-        sockaddr peer;
-        socklen_t len = sizeof(peer);
-        ::getpeername(fd, &peer, &len);
+        pid_t pid;
+        if ((pid = ::fork()) < 0) {
+            ::printf("failed to create subprocess, %s\n", ::strerror(errno));
+            return -1;
+        }
+        else if (pid == 0) {
+            ::close(fd);
+            if ((pid = ::fork()) > 0) {
+                ::close(client);
+                return -1;
+            }
+            else if (pid < 0) {
+                ::printf("failed to create subprocess, %s\n", ::strerror(errno));
+                ::close(client);
+                return -1;
+            }
 
-        sockaddr_in *ppeer = reinterpret_cast<sockaddr_in *>(&peer);
-        ::inet_ntop(AF_INET, &ppeer->sin_addr.s_addr, addr_str, sizeof(ppeer->sin_addr.s_addr));
-        ::printf("connect to %s:%d\n", addr_str, ppeer->sin_port);
+            sockaddr peer;
+            socklen_t len = sizeof(peer);
+            ::getpeername(fd, &peer, &len);
 
-        while (true) {
-            std::string request;
-            char buf[1025];
+            sockaddr_in *ppeer = reinterpret_cast<sockaddr_in *>(&peer);
+            ::inet_ntop(AF_INET, &ppeer->sin_addr.s_addr, addr_str, sizeof(ppeer->sin_addr.s_addr));
+            ::printf("connect to %s:%d\n", addr_str, ppeer->sin_port);
+
             while (true) {
-                ssize_t res = ::read(client, buf, 1024);
-                if (res < 0)
-                    break;
-                buf[res] = '\0';
-                request += buf;
-                if (request.size() >= 2 && !request.compare(request.size() - 2, 2, "\r\n"))
+                std::string request;
+                char buf[1025];
+                while (true) {
+                    ssize_t res = ::read(client, buf, 1024);
+                    if (res < 0)
+                        break;
+                    buf[res] = '\0';
+                    request += buf;
+                    if (request.size() >= 2 && !request.compare(request.size() - 2, 2, "\r\n"))
+                        break;
+                }
+
+                ::write(client, request.c_str(), request.size());
+                if (request == "exit\r\n")
                     break;
             }
 
-            ::write(client, request.c_str(), request.size());
-            if (request == "exit\r\n")
-                break;
+            ::close(client);
+            return 0;
         }
-
-        ::close(client);
+        else {
+            ::close(client);
+        }
     }
 
     ::close(fd);
