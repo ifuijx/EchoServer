@@ -8,6 +8,13 @@
 #include <malloc.h>
 #include <string.h>
 #include <string>
+#include <sys/select.h>
+#include <vector>
+#include <set>
+#include <thread>
+#include <mutex>
+#include <memory>
+#include <limits>
 
 int initserver(int type, const sockaddr *addr, socklen_t alen, int qlen) {
     int fd;
@@ -30,6 +37,30 @@ errout:
     errno = err;
     return -1;
 }
+
+template <typename TEle>
+class AsyncSet {
+public:
+    void add(TEle val) {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        set_.insert(val);
+    }
+
+    void erase(TEle val) {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        set_.erase(val);
+    }
+
+    std::vector<TEle> items() const {
+        std::scoped_lock<std::mutex> lock(mutex_);
+        std::vector<TEle> ret(set_.begin(), set_.end());
+        return ret;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    std::set<TEle> set_;
+};
 
 constexpr in_port_t port = 57311;
 
@@ -70,61 +101,74 @@ int main() {
         return -1;
     }
 
+    AsyncSet<int> async_fds;
+    std::thread echo([&async_fds] {
+        while (true) {
+            auto fds = async_fds.items();
+            fd_set fd_set;
+            FD_ZERO(&fd_set);
+            int max_fd = std::numeric_limits<int>::min();
+            for (auto fd : fds) {
+                max_fd = std::max(max_fd, fd);
+                FD_SET(fd, &fd_set);
+            }
+            max_fd = std::max(max_fd, 0);
+
+            timeval timeout {
+                .tv_sec = 0,
+                .tv_usec = 1000 * 50,
+            };
+            auto res = ::select(max_fd + 1, &fd_set, nullptr, nullptr, &timeout);
+
+            if (res < 0) {
+                ::printf("Failed to select, %s\n", ::strerror(errno));
+                return;
+            }
+            else {
+                for (int fd = 0, cnt = 0; fd <= max_fd && cnt < res; ++fd) {
+                    if (FD_ISSET(fd, &fd_set)) {
+                        ++cnt;
+
+                        int client = fd;
+                        std::string request;
+                        char buf[1025];
+                        while (true) {
+                            ssize_t res = ::read(client, buf, 1024);
+                            if (res < 0)
+                                break;
+                            buf[res] = '\0';
+                            request += buf;
+                            if (request.size() >= 2 && !request.compare(request.size() - 2, 2, "\r\n"))
+                                break;
+                        }
+
+                        ::write(client, request.c_str(), request.size());
+                        if (request == "exit\r\n") {
+                            ::close(client);
+                            async_fds.erase(client);
+                        }
+                    }
+                }
+            }
+        }
+    });
+    echo.detach();
+
     while (true) {
         int client;
         if ((client = ::accept(fd, nullptr, nullptr)) < 0) {
             ::printf("failed to accept, %s\n", ::strerror(errno));
         }
 
-        pid_t pid;
-        if ((pid = ::fork()) < 0) {
-            ::printf("failed to create subprocess, %s\n", ::strerror(errno));
-            return -1;
-        }
-        else if (pid == 0) {
-            ::close(fd);
-            if ((pid = ::fork()) > 0) {
-                ::close(client);
-                return -1;
-            }
-            else if (pid < 0) {
-                ::printf("failed to create subprocess, %s\n", ::strerror(errno));
-                ::close(client);
-                return -1;
-            }
+        sockaddr peer;
+        socklen_t len = sizeof(peer);
+        ::getpeername(client, &peer, &len);
 
-            sockaddr peer;
-            socklen_t len = sizeof(peer);
-            ::getpeername(fd, &peer, &len);
+        sockaddr_in *ppeer = reinterpret_cast<sockaddr_in *>(&peer);
+        ::inet_ntop(AF_INET, &ppeer->sin_addr.s_addr, addr_str, sizeof(ppeer->sin_addr.s_addr));
+        ::printf("connect to %s:%d\n", addr_str, ppeer->sin_port);
 
-            sockaddr_in *ppeer = reinterpret_cast<sockaddr_in *>(&peer);
-            ::inet_ntop(AF_INET, &ppeer->sin_addr.s_addr, addr_str, sizeof(ppeer->sin_addr.s_addr));
-            ::printf("connect to %s:%d\n", addr_str, ppeer->sin_port);
-
-            while (true) {
-                std::string request;
-                char buf[1025];
-                while (true) {
-                    ssize_t res = ::read(client, buf, 1024);
-                    if (res < 0)
-                        break;
-                    buf[res] = '\0';
-                    request += buf;
-                    if (request.size() >= 2 && !request.compare(request.size() - 2, 2, "\r\n"))
-                        break;
-                }
-
-                ::write(client, request.c_str(), request.size());
-                if (request == "exit\r\n")
-                    break;
-            }
-
-            ::close(client);
-            return 0;
-        }
-        else {
-            ::close(client);
-        }
+        async_fds.add(client);
     }
 
     ::close(fd);
